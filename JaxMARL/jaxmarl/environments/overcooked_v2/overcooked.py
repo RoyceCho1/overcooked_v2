@@ -1129,7 +1129,7 @@ class OvercookedV2(MultiAgentEnv):
                 return jnp.array([cell[0], new_ingredients, new_extra])
 
             def _indicator(cell):
-                new_extra = jnp.clip(cell[2] - 1, min=0)
+                new_extra = jnp.clip(cell[2] - 1, 0)
                 return cell.at[2].set(new_extra)
 
             # return jax.lax.cond(is_pot, _cook, lambda x: x, cell)
