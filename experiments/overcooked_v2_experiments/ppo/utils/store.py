@@ -109,4 +109,4 @@ def load_all_checkpoints(run_dir, final_only=True, skip_initial=False):
         # all_checkpoints.append(checkpoints)
         all_checkpoints[run_num_dir.name] = checkpoints
 
-    return all_checkpoints, config
+    return all_checkpoints, first_config

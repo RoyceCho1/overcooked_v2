@@ -21,7 +21,7 @@ import wandb
 import functools
 import math
 import pickle
-from models.rnn import ScannedRNN
+from overcooked_v2_experiments.ppo.models.rnn import ScannedRNN
 import matplotlib.pyplot as plt
 from jaxmarl.environments.overcooked_v2.overcooked import ObservationType
 from overcooked_v2_experiments.eval.policy import AbstractPolicy
@@ -29,6 +29,42 @@ from overcooked_v2_experiments.ppo.models.abstract import ActorCriticBase
 from .models.model import get_actor_critic, initialize_carry
 from overcooked_v2_experiments.eval.policy import AbstractPolicy
 from flax import core
+
+
+# ... (Imports)
+from overcooked_v2_experiments.recipe.recipe_encoder_jax import RecipeEncoder
+from overcooked_v2_experiments.recipe.context import RecipeContextManager
+import orbax.checkpoint as ocp
+from jaxmarl.environments.overcooked_v2.common import DynamicObject
+from overcooked_v2_experiments.recipe.masking import get_mask_fn
+
+def decode_recipe(recipe_bits):
+    idxs = DynamicObject.get_ingredient_idx_list_jit(recipe_bits)
+    idxs = jnp.array(idxs)
+    # For demo_cook_simple, recipes are [0,0,0] or [1,1,1].
+    # We can just take the first ingredient index.
+    # idxs is guaranteed to be valid for active recipes.
+    return idxs[0].astype(jnp.int32)
+
+def make_oracle_context(env_state_recipe):
+    # env_state_recipe: (num_envs,) int32
+    # DynamicObject.get_ingredient_idx_list_jit is vmapped inside if needed, 
+    # but here we might receive batched input. 
+    # DynamicObject methods are usually scalar JIT functions, so we need vmap if input is batched.
+    
+    # We define a scalar function and vmap it
+    def _get_ctx(recipe):
+        idxs = DynamicObject.get_ingredient_idx_list_jit(recipe)
+        first_idx = idxs[0] # Take first ingredient index
+        # Assuming index 0 -> Recipe 0, index 1 -> Recipe 1?
+        # In demo_cook_simple: 
+        #   Ingredients: output_idx=0 (Tomato?), output_idx=1 (Lettuce?)
+        #   Recipes: [0,0,0] (Tomato Salad), [1,1,1] (Lettuce Salad)
+        # So first_idx will be 0 or 1.
+        first_idx = jnp.clip(first_idx, 0, 1) 
+        return jax.nn.one_hot(first_idx, 2)
+        
+    return jax.vmap(_get_ctx)(env_state_recipe)
 
 
 class Transition(NamedTuple):
@@ -40,6 +76,7 @@ class Transition(NamedTuple):
     obs: jnp.ndarray
     info: jnp.ndarray
     train_mask: jnp.ndarray
+    recipe_ctx: jnp.ndarray
 
 
 def batchify(x: dict, agent_list, num_actors):
@@ -97,6 +134,68 @@ def make_train(
             params,
         )
 
+    # Context Setup
+    context_mode = config.get("context_mode", "encoder")
+    use_recipe_encoder = config.get("USE_RECIPE_ENCODER", True)
+    
+    # Override logic: IF oracle, force NO encoder usage
+    if context_mode == "oracle":
+        use_recipe_encoder = False
+
+    # --- Recipe Encoder Setup ---
+    encoder_path = config.get("RECIPE_ENCODER_PATH", "/home/myuser/recipe_encoder_ckpt_v2")
+    
+    # Initialize dummy encoder to get params structure
+    dummy_encoder = RecipeEncoder()
+    obs_shape = env.observation_space().shape
+    dummy_obs = jnp.zeros((1, 10, *obs_shape)) # (B, T, H, W, C)
+    dummy_act = jnp.zeros((1, 10, 6))       # (B, T, A)
+    dummy_params = dummy_encoder.init(jax.random.PRNGKey(0), dummy_obs, dummy_act)['params']
+    
+    encoder_params = dummy_params # Default to dummy
+    
+    if "FCP" in config and config["FCP"] and context_mode == "encoder":
+        print(f"Loading Recipe Encoder from {encoder_path}")
+        # Load checkpoint
+        orbax_checkpointer = ocp.PyTreeCheckpointer()
+        if os.path.exists(encoder_path):
+             encoder_params = orbax_checkpointer.restore(encoder_path, item=dummy_params)
+        else:
+             print(f"Warning: Encoder path {encoder_path} not found. Using dummy params.")
+    else:
+        if context_mode == "oracle":
+            print("Recipe Encoder disabled (Oracle Mode).")
+        elif not use_recipe_encoder:
+            print("Recipe Encoder disabled by config (USE_RECIPE_ENCODER=False).")
+        else:
+            print("FCP disabled or Context Mode != encoder. Using dummy params.")
+
+    # Initialize Context Manager
+    
+    # DEBUG: Check observation shape
+    obs_shape = env.observation_space().shape
+    print(f"DEBUG: Environment Observation Shape: {obs_shape}")
+    if obs_shape[-1] != 38 and not use_recipe_encoder:
+        print("WARNING: SP is expecting 38 channels but Env has different shape! This might cause shape mismatch later.")
+    
+    context_manager = None
+    if context_mode == "encoder":
+        context_manager = RecipeContextManager(
+            encoder_apply_fn=dummy_encoder.apply,
+            encoder_params=encoder_params,
+            K=10,
+            num_envs=model_config["NUM_ENVS"],
+            num_actions=6,
+            obs_shape=obs_shape,
+            mask_fn=get_mask_fn(num_ingredients=3) # demo_cook_simple assumption
+        )
+    else:
+        # oracle / none modes
+        context_manager = None
+        print(f"Recipe Context Manager: DISABLED ({context_mode} Mode)")
+    # ----------------------------
+    # ----------------------------
+
     env = OvercookedV2LogWrapper(env, replace_info=False)
 
     def create_learning_rate_fn():
@@ -136,13 +235,19 @@ def make_train(
         transition_steps=model_config["REW_SHAPING_HORIZON"],
     )
 
-    train_idxs = jnp.linspace(
-        0,
-        env.num_agents,
-        model_config["NUM_ENVS"],
-        dtype=jnp.int32,
-        endpoint=False,
-    )
+    # If FCP is provided, we are training an Ego agent against a population.
+    # The user requested to fix the Ego agent to index 1 (Right).
+    if "FCP" in config and config["FCP"]:
+        train_idxs = jnp.ones((model_config["NUM_ENVS"],), dtype=jnp.int32) * 1
+    else:
+        # For Self-Play, we want to train on both positions (distributed across envs).
+        train_idxs = jnp.linspace(
+            0,
+            env.num_agents,
+            model_config["NUM_ENVS"],
+            dtype=jnp.int32,
+            endpoint=False,
+        )
     train_mask_dict = {a: train_idxs == i for i, a in enumerate(env.agents)}
     train_mask_flat = batchify(
         train_mask_dict, env.agents, model_config["NUM_ACTORS"]
@@ -184,12 +289,21 @@ def make_train(
 
         rng, _rng = jax.random.split(rng)
 
-        init_x = (
-            jnp.zeros(
-                (1, model_config["NUM_ENVS"], *env.observation_space().shape),
-            ),
-            jnp.zeros((1, model_config["NUM_ENVS"])),
-        )
+        if "FCP" in config and config["FCP"] and (use_recipe_encoder or context_mode == "oracle"):
+            init_x = (
+                jnp.zeros(
+                    (1, model_config["NUM_ENVS"], *env.observation_space().shape),
+                ),
+                jnp.zeros((1, model_config["NUM_ENVS"])),
+                jnp.zeros((1, model_config["NUM_ENVS"], 2)), # recipe_ctx
+            )
+        else:
+            init_x = (
+                jnp.zeros(
+                    (1, model_config["NUM_ENVS"], *env.observation_space().shape),
+                ),
+                jnp.zeros((1, model_config["NUM_ENVS"])),
+            )
         init_hstate = initialize_carry(config, model_config["NUM_ENVS"])
 
         if init_hstate is not None:
@@ -223,6 +337,15 @@ def make_train(
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, model_config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset)(reset_rng)
+        
+        # --- Context Init ---
+        current_recipes = jax.vmap(decode_recipe)(env_state.env_state.recipe)
+        if context_manager is not None:
+            context_state = context_manager.init_state(current_recipes)
+        else:
+            context_state = None
+        # --------------------
+
         init_hstate = initialize_carry(config, model_config["NUM_ACTORS"])
         # jax.debug.print("check2 {x}", x=init_hstate.flatten()[0])
 
@@ -283,6 +406,7 @@ def make_train(
                 last_population_annealing_mask,
                 initial_fcp_pop_agent_idxs,
                 rng,
+                context_state, # NEW
             ) = runner_state
 
             # jax.debug.print("check3 {x}", x=initial_hstate.flatten()[0])
@@ -300,7 +424,9 @@ def make_train(
                     population_annealing_mask,
                     fcp_pop_agent_idxs,
                     rng,
+                    context_state, # NEW
                 ) = env_step_state
+
 
                 # jax.debug.print("check4 {x}", x=hstate.flatten()[0])
 
@@ -311,10 +437,35 @@ def make_train(
                     -1, *env.observation_space().shape
                 )
 
-                ac_in = (
-                    obs_batch[np.newaxis, :],
-                    last_done[np.newaxis, :],
-                )
+                # --- Context ---
+                # --- Context ---
+                if context_mode == "encoder" and context_state is not None:
+                    recipe_ctx_batch = jnp.tile(context_state.recipe_ctx, (env.num_agents, 1))
+                elif context_mode == "oracle":
+                    # Generate from ground truth
+                    # env_state.env_state.recipe is (Num_envs,)
+                    batch_ctx = make_oracle_context(env_state.env_state.recipe) # (Num_envs, 2)
+                    recipe_ctx_batch = jnp.tile(batch_ctx, (env.num_agents, 1)) # (Num_envs*Agents, 2)
+                else:
+                    # Dummy context for SP (unused by network but needed for Transition structure if implied)
+                    # Wait, if FCP=False, we don't use it.
+                    # But Transition tuple probably needs it? 
+                    # Let's check Transition def (it has recipe_ctx field).
+                    # We should provide a zero array of shape (N, 2).
+                    recipe_ctx_batch = jnp.zeros((model_config["NUM_ACTORS"], 2))
+                # ---------------
+
+                if "FCP" in config and config["FCP"] and (context_mode in ["encoder", "oracle"]):
+                    ac_in = (
+                        obs_batch[np.newaxis, :],
+                        last_done[np.newaxis, :],
+                        recipe_ctx_batch[np.newaxis, :], # NEW
+                    )
+                else:
+                    ac_in = (
+                        obs_batch[np.newaxis, :],
+                        last_done[np.newaxis, :],
+                    )
 
                 hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
 
@@ -393,6 +544,25 @@ def make_train(
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
+                
+                # --- Update Context ---
+                current_recipes = jax.vmap(decode_recipe)(env_state.env_state.recipe)
+                partner_obs = last_obs[env.agents[0]] # agent_0
+                partner_act = env_act[env.agents[0]]  # agent_0 action
+                
+                if context_mode == "encoder" and context_manager is not None:
+                    context_state = context_manager.update(
+                        context_state,
+                        partner_obs,
+                        partner_act,
+                        current_recipes,
+                        done["__all__"]
+                    )
+                else:
+                    # Keep same context if no manager (SP mode or Oracle mode)
+                    context_state = context_state
+                # ----------------------
+
                 original_reward = jnp.array([reward[a] for a in env.agents])
 
                 current_timestep = (
@@ -456,6 +626,7 @@ def make_train(
                     obs_batch,
                     info,
                     action_pick_mask,
+                    recipe_ctx_batch, # NEW
                 )
 
                 # jax.debug.print("check6 {x}", x=hstate.flatten()[0])
@@ -471,6 +642,7 @@ def make_train(
                     new_population_annealing_mask,
                     new_fcp_pop_agent_idxs,
                     rng,
+                    context_state, # NEW
                 )
                 return env_step_state, transition
 
@@ -485,6 +657,7 @@ def make_train(
                 last_population_annealing_mask,
                 initial_fcp_pop_agent_idxs,
                 rng,
+                context_state, # NEW: Add context_state
             )
             env_step_state, traj_batch = jax.lax.scan(
                 _env_step, env_step_state, None, model_config["NUM_STEPS"]
@@ -500,6 +673,7 @@ def make_train(
                 last_population_annealing_mask,
                 next_fcp_pop_agent_idxs,
                 rng,
+                context_state, # NEW: Unpack updated context_state
             ) = env_step_state
 
             # jax.debug.print("check7 {x}", x=next_initial_hstate)
@@ -510,10 +684,27 @@ def make_train(
             last_obs_batch = jnp.stack([last_obs[a] for a in env.agents]).reshape(
                 -1, *env.observation_space().shape
             )
-            ac_in = (
-                last_obs_batch[np.newaxis, :],
-                last_done[np.newaxis, :],
-            )
+            
+            # --- Context for Last Value ---
+            # Use the UPDATED context_state from env_step_state
+            if context_state is not None:
+                recipe_ctx_batch = jnp.tile(context_state.recipe_ctx, (env.num_agents, 1))
+            else:
+                 recipe_ctx_batch = jnp.zeros((model_config["NUM_ACTORS"], 2))
+            # ------------------------------
+
+            if "FCP" in config and config["FCP"] and (use_recipe_encoder or context_mode == "oracle"):
+                ac_in = (
+                    last_obs_batch[np.newaxis, :],
+                    last_done[np.newaxis, :],
+                    recipe_ctx_batch[np.newaxis, :], # NEW
+                )
+            else:
+                ac_in = (
+                    last_obs_batch[np.newaxis, :],
+                    last_done[np.newaxis, :],
+                )
+
             _, _, last_val = network.apply(
                 train_state.params, next_initial_hstate, ac_in
             )
@@ -567,10 +758,15 @@ def make_train(
                             train_mask = jax.lax.stop_gradient(traj_batch.train_mask)
 
                         # RERUN NETWORK
+                        if "FCP" in config and config["FCP"] and (use_recipe_encoder or context_mode == "oracle"):
+                            ac_in = (traj_batch.obs, traj_batch.done, traj_batch.recipe_ctx)
+                        else:
+                            ac_in = (traj_batch.obs, traj_batch.done)
+
                         _, pi, value = network.apply(
                             params,
                             hstate,
-                            (traj_batch.obs, traj_batch.done),
+                            ac_in,
                         )
 
                         print("value shape", value.shape)
@@ -772,6 +968,7 @@ def make_train(
                     {f"rng{int(original_seed)}/{k}": v for k, v in metric.items()}
                 )
                 wandb.log(metric)
+                print(f"[Seed {int(original_seed)}] Update: {metric['update_step']} | Env Step: {metric['env_step']} | Reward: {metric['combined_reward']:.2f}")
 
             jax.debug.callback(callback, metric, original_seed)
 
@@ -798,6 +995,7 @@ def make_train(
                 last_population_annealing_mask,
                 next_fcp_pop_agent_idxs,
                 rng,
+                context_state, # NEW
             )
             return runner_state, metric
 
@@ -840,6 +1038,7 @@ def make_train(
             init_population_annealing_mask,
             init_fcp_pop_idxs,
             _rng,
+            context_state, # NEW
         )
         num_update_steps = model_config["NUM_UPDATES"]
         if update_step_num_overwrite is not None:

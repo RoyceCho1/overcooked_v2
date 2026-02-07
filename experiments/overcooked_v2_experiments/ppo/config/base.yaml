@@ -1,5 +1,6 @@
 defaults:
-  # - env: default
+  - _self_
+  - env: default
   - wandb: default
   - model: cnn
 
@@ -8,5 +9,6 @@ NUM_SEEDS: 10
 TUNE: False
 NUM_CHECKPOINTS: 3
 VISUALIZE: False
+USE_RECIPE_ENCODER: True
 
 # NUM_ITERATIONS: 10

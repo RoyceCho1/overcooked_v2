@@ -55,7 +55,13 @@ class ActorCriticRNN(ActorCriticBase):
 
     @nn.compact
     def __call__(self, hidden, x, train=False):
-        obs, dones = x
+        # x structure: (obs, dones, recipe_ctx)
+        # Check if x has 3 elements
+        if len(x) == 3:
+            obs, dones, recipe_ctx = x
+        else:
+            obs, dones = x
+            recipe_ctx = None
 
         # print("cnn shapes", hidden.shape, obs.shape, dones.shape)
 
@@ -66,16 +72,6 @@ class ActorCriticRNN(ActorCriticBase):
         else:
             activation = nn.tanh
 
-        # embedding_mlp = MLP(
-        #     hidden_size=self.config["FC_DIM_SIZE"],
-        #     output_size=self.config["FC_DIM_SIZE"],
-        #     activation=activation,
-        # )
-
-        # embedding = jax.vmap(
-        #     jax.vmap(embedding_mlp, in_axes=-2, out_axes=-2), in_axes=-2, out_axes=-2
-        # )(embedding)
-
         embed_model = CNN(
             # output_size=self.config["FC_DIM_SIZE"] * 2,
             output_size=self.config["GRU_HIDDEN_DIM"],
@@ -85,39 +81,16 @@ class ActorCriticRNN(ActorCriticBase):
 
         embedding = nn.LayerNorm()(embedding)
 
-        # embedding_1_mlp = MLP(
-        #     hidden_size=self.config["FC_DIM_SIZE"],
-        #     output_size=self.config["FC_DIM_SIZE"],
-        #     activation=activation,
-        # )
-        # embedding = jax.vmap(
-        #     jax.vmap(embedding_1_mlp, in_axes=-2, out_axes=-2), in_axes=-2, out_axes=-2
-        # )(embedding)
-
-        # embedding = nn.Dense(
-        #     self.config["GRU_HIDDEN_DIM"],
-        #     kernel_init=orthogonal(jnp.sqrt(2)),
-        #     bias_init=constant(0.0),
-        # )(embedding)
-
         rnn_in = (embedding, dones)
         # print("rnn_in shapes", hidden.shape, rnn_in[0].shape, rnn_in[1].shape)
         hidden, embedding = ScannedRNN()(hidden, rnn_in)
-
-        # embedding = nn.Dense(
-        #     self.config["FC_DIM_SIZE"],
-        #     kernel_init=orthogonal(jnp.sqrt(2)),
-        #     bias_init=constant(0.0),
-        # )(embedding)
-
-        # embedding_2_mlp = MLP(
-        #     hidden_size=self.config["FC_DIM_SIZE"],
-        #     output_size=self.config["FC_DIM_SIZE"],
-        #     activation=activation,
-        # )
-        # embedding = jax.vmap(
-        #     jax.vmap(embedding_2_mlp, in_axes=-2, out_axes=-2), in_axes=-2, out_axes=-2
-        # )(embedding)
+        
+        # --- NEW: Concatenate Recipe Context ---
+        if recipe_ctx is not None:
+            # recipe_ctx: (Batch, 2)
+            # embedding: (Batch, Hidden)
+            embedding = jnp.concatenate([embedding, recipe_ctx], axis=-1)
+        # ---------------------------------------
 
         actor_mean = nn.Dense(
             self.config["FC_DIM_SIZE"],
@@ -142,12 +115,5 @@ class ActorCriticRNN(ActorCriticBase):
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
         )
-
-        # print(
-        #     "output shapes",
-        #     hidden.shape,
-        #     pi.logits.shape,
-        #     jnp.squeeze(critic, axis=-1).shape,
-        # )
 
         return hidden, pi, jnp.squeeze(critic, axis=-1)

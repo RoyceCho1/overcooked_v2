@@ -2,3 +2,16 @@
 defaults:
   - override /model: rnn
 
+model:
+  LR: 0.00025
+  ENT_COEF: 0.01
+  GAE_LAMBDA: 0.95
+  TOTAL_TIMESTEPS: 3e7
+  NUM_ENVS: 256
+  NUM_STEPS: 256
+  NUM_MINIBATCHES: 64
+  UPDATE_EPOCHS: 4
+  MAX_GRAD_NORM: 0.25
+  VF_COEF: 0.5
+  CLIP_EPS: 0.2
+  ANNEAL_LR: True

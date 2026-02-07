@@ -3,5 +3,5 @@
   "layout": "demo_cook_simple"
   "agent_view_size": 2
   "negative_rewards": True
-  "random_agent_positions": True
+  "random_agent_positions": False
   "sample_recipe_on_delivery": True

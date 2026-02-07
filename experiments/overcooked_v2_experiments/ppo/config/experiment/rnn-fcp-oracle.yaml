@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - rnn-fcp
+
+context_mode: "oracle"
+use_recipe_encoder: false

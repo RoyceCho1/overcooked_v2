@@ -1,3 +1,4 @@
+# 평가 엔진 & 시각화 진입점. 정책 페어링을 받아 환경을 돌려 점수·프레임 시퀀스를 생성.
 import argparse
 from collections import defaultdict
 from typing import List

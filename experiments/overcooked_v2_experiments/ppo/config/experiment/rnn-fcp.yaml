@@ -5,21 +5,19 @@ defaults:
 NUM_SEEDS: 1
 
 model:
-  # "TOTAL_TIMESTEPS": 3e7
-  # "REW_SHAPING_HORIZON": 2e7
-  # "LR_WARMUP": 0.05
-  "LR": 0.0007
-  "ENT_COEF": 0.04
+  LR: 0.0007
+  ENT_COEF: 0.04
+  GAE_LAMBDA: 0.9
+  TOTAL_TIMESTEPS: 3e6 # User specified 3,000,000
+  NUM_ENVS: 256
+  NUM_STEPS: 256
+  NUM_MINIBATCHES: 64
+  UPDATE_EPOCHS: 4
+  MAX_GRAD_NORM: 0.25
+  VF_COEF: 0.5
+  CLIP_EPS: 0.2
+  ANNEAL_LR: True
 
-  # "ENT_COEF": 0.02
-  # "NUM_ENVS": 256
-  # "NUM_STEPS": 256
-  # "UPDATE_EPOCHS": 8
-  # "NUM_MINIBATCHES": 32
-  # "CLIP_EPS": 0.2
-  # "MAX_GRAD_NORM": 0.5
-  "GAE_LAMBDA": 0.9
-
-
-# POPULATION_ANNEAL_HORIZON: 3e7
-# POPULATION_ANNEAL_BEGIN: 0e7
+# Default FCP settings
+context_mode: "encoder"
+use_recipe_encoder: true

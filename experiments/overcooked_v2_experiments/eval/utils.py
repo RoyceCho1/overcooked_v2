@@ -1,3 +1,4 @@
+# 평가 보조 유틸(예: 레시피 식별자 문자열 생성 등).
 import os
 from datetime import datetime
 from pathlib import Path
