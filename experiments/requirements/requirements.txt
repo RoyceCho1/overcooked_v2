@@ -4,3 +4,7 @@ matplotlib
 pandas
 seaborn
 clu
+hydra-core
+distrax
+tqdm
+torch==2.5.1+cpu
