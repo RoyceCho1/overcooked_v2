@@ -2,5 +2,5 @@
 defaults:
   - rnn-fcp
 
-context_mode: "oracle"
+context_mode: "none"
 USE_RECIPE_ENCODER: false

@@ -8,7 +8,6 @@ import os
 from datetime import datetime
 import jax.numpy as jnp
 
-from overcooked_v2_experiments.human_rl.imitation.bc_policy import BCPolicy
 from overcooked_v2_experiments.ppo.policy import PPOParams
 from overcooked_v2_experiments.ppo.utils.fcp import FCPWrapperPolicy
 from .ippo import make_train
@@ -112,6 +111,8 @@ def single_run(config):
 
     bc_policy = None
     if "BC" in config:
+        from overcooked_v2_experiments.human_rl.imitation.bc_policy import BCPolicy
+
         print("Training with BC")
         layout_name = config["env"]["ENV_KWARGS"]["layout"]
         split = "all"

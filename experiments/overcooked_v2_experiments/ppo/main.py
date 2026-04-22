@@ -9,7 +9,6 @@ import wandb
 
 from overcooked_v2_experiments.ppo.policy import PPOParams
 from overcooked_v2_experiments.ppo.utils.store import load_all_checkpoints, store_checkpoint
-from overcooked_v2_experiments.ppo.state_sample_run import state_sample_run
 from overcooked_v2_experiments.ppo.run import single_run
 from overcooked_v2_experiments.ppo.tune import tune
 from overcooked_v2_experiments.ppo.utils.utils import get_run_base_dir
@@ -90,6 +89,9 @@ def main(config):
     if config["TUNE"]:
         tune(config)
     elif "NUM_ITERATIONS" in config:
+        # Import lazily so regular SP/OP/FCP runs do not require BC/human data deps.
+        from overcooked_v2_experiments.ppo.state_sample_run import state_sample_run
+
         state_sample_run(config)
     else:
         single_run_with_viz(config)

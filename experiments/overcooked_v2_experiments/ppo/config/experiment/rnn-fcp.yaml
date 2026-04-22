@@ -20,4 +20,6 @@ model:
 
 # Default FCP settings
 context_mode: "encoder"
-use_recipe_encoder: true
+USE_RECIPE_ENCODER: true
+RECIPE_ENCODER_USE_ACTIONS: false
+RECIPE_ENCODER_K: 10

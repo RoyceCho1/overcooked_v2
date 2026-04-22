@@ -10,7 +10,6 @@ import jax.numpy as jnp
 
 from overcooked_v2_experiments.eval.policy import PolicyPairing
 from overcooked_v2_experiments.eval.rollout import get_rollout
-from overcooked_v2_experiments.human_rl.imitation.bc_policy import BCPolicy
 from overcooked_v2_experiments.ppo.models.model import (
     get_actor_critic,
     initialize_carry,
@@ -65,6 +64,8 @@ def state_sample_run(config):
 
     hp_policy = None
     if "BC" in config:
+        from overcooked_v2_experiments.human_rl.imitation.bc_policy import BCPolicy
+
         print("Training with BC")
         split = "all"
         run_id = hp_indices[layout_name]
