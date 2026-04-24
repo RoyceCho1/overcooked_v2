@@ -70,7 +70,6 @@ class PPOPolicy(AbstractPolicy):
 
     def init_hstate(self, batch_size, key=None):
         # assert batch_size == 1 or self.with_batching
-        print("Initializing hstate with batch size", batch_size)
         return initialize_carry(self.config, batch_size)
 
 
