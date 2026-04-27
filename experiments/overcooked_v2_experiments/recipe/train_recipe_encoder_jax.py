@@ -1,4 +1,5 @@
 import json
+import math
 import os
 
 import jax
@@ -6,9 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
-import torch
 from flax.training import train_state
-from torch.utils.data import DataLoader, random_split
 
 from overcooked_v2_experiments.recipe.recipe_encoder_jax import (
     RecipeEncoder,
@@ -16,13 +15,50 @@ from overcooked_v2_experiments.recipe.recipe_encoder_jax import (
 )
 
 
-def _numpy_collate(batch):
-    if isinstance(batch[0], np.ndarray):
-        return np.stack(batch)
-    if isinstance(batch[0], (tuple, list)):
-        transposed = zip(*batch)
-        return [np.stack(samples) for samples in transposed]
-    return np.array(batch)
+def _split_indices(n: int, val_split: float, seed: int):
+    if n <= 0:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+    rng = np.random.default_rng(seed)
+    all_idx = np.arange(n, dtype=np.int32)
+    rng.shuffle(all_idx)
+
+    val_size = int(n * val_split)
+    if n >= 2:
+        val_size = min(max(val_size, 1), n - 1)
+    else:
+        val_size = 0
+
+    val_idx = all_idx[:val_size]
+    train_idx = all_idx[val_size:]
+    return train_idx, val_idx
+
+
+def _iter_batches(dataset, indices, batch_size: int, shuffle: bool, seed: int):
+    if len(indices) == 0:
+        return
+
+    idx = np.array(indices, copy=True)
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(idx)
+
+    for start in range(0, len(idx), batch_size):
+        batch_ids = idx[start : start + batch_size]
+        obs_list = []
+        act_list = []
+        label_list = []
+        for i in batch_ids:
+            obs, act, label = dataset[int(i)]
+            obs_list.append(obs)
+            act_list.append(act)
+            label_list.append(label)
+
+        yield (
+            np.stack(obs_list, axis=0),
+            np.stack(act_list, axis=0),
+            np.array(label_list, dtype=np.int32),
+        )
 
 
 def train(
@@ -42,30 +78,8 @@ def train(
         print("No data found. Exiting.")
         return
 
-    val_size = int(len(full_dataset) * val_split)
-    train_size = len(full_dataset) - val_size
-
-    generator = torch.Generator().manual_seed(seed)
-    train_dataset, val_dataset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=generator,
-    )
-
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=_numpy_collate,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=_numpy_collate,
-    )
+    train_idx, val_idx = _split_indices(len(full_dataset), val_split, seed)
+    print(f"Train samples: {len(train_idx)}, Val samples: {len(val_idx)}")
 
     sample_obs, sample_act, _ = full_dataset[0]
 
@@ -124,7 +138,7 @@ def train(
 
     from tqdm import tqdm
 
-    best_val_acc = 0.0
+    best_val_acc = -1.0
     checkpointer = ocp.PyTreeCheckpointer()
 
     for epoch in range(epochs):
@@ -132,7 +146,19 @@ def train(
         train_acc_sum = 0.0
         train_batches = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]", leave=False)
+        train_total_batches = max(math.ceil(len(train_idx) / batch_size), 1)
+        pbar = tqdm(
+            _iter_batches(
+                full_dataset,
+                train_idx,
+                batch_size=batch_size,
+                shuffle=True,
+                seed=seed + epoch,
+            ),
+            total=train_total_batches,
+            desc=f"Epoch {epoch + 1}/{epochs} [Train]",
+            leave=False,
+        )
         for batch in pbar:
             obs, act, labels = batch
             obs = jnp.array(obs)
@@ -153,7 +179,13 @@ def train(
         val_acc_sum = 0.0
         val_batches = 0
 
-        for batch in val_loader:
+        for batch in _iter_batches(
+            full_dataset,
+            val_idx,
+            batch_size=batch_size,
+            shuffle=False,
+            seed=seed,
+        ):
             obs, act, labels = batch
             obs = jnp.array(obs)
             act = jnp.array(act)
@@ -188,17 +220,27 @@ def train(
             print(f"  -> Model saved to {save_path}")
 
             meta_path = f"{abs_save_path}.meta.json"
+            segment_k = None
+            dataset_meta_path = os.path.join(os.path.abspath(data_dir), "dataset_meta.json")
+            if os.path.exists(dataset_meta_path):
+                try:
+                    with open(dataset_meta_path, "r", encoding="utf-8") as df:
+                        dataset_meta = json.load(df)
+                    if "segment_k" in dataset_meta:
+                        segment_k = int(dataset_meta["segment_k"])
+                except Exception:
+                    segment_k = None
+
             with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "use_actions": bool(use_actions),
-                        "num_classes": int(full_dataset.num_classes),
-                        "action_dim": int(action_dim),
-                        "data_dir": os.path.abspath(data_dir),
-                    },
-                    f,
-                    indent=2,
-                )
+                meta = {
+                    "use_actions": bool(use_actions),
+                    "num_classes": int(full_dataset.num_classes),
+                    "action_dim": int(action_dim),
+                    "data_dir": os.path.abspath(data_dir),
+                }
+                if segment_k is not None:
+                    meta["segment_k"] = int(segment_k)
+                json.dump(meta, f, indent=2)
             print(f"  -> Metadata saved to {meta_path}")
 
 
