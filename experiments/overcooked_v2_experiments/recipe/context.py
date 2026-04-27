@@ -56,14 +56,30 @@ class RecipeContextManager:
             valid_mask=jnp.zeros((self.num_envs,), dtype=jnp.bool_),
         )
 
-    def update(self, state: ContextState, ego_obs, partner_act, current_recipes, dones):
+    def update(
+        self,
+        state: ContextState,
+        ego_obs,
+        partner_act,
+        current_recipes,
+        dones,
+        next_recipes=None,
+    ):
+        """Update context using timestep-aligned recipe semantics.
+
+        ``ego_obs`` and ``partner_act`` are from timestep t and are written under
+        ``current_recipes`` (recipe_t). ``next_recipes`` is only used to prepare
+        the context state for timestep t+1 after an env step.
+        """
         # 1) Input masking to prevent recipe leakage.
         if self.mask_fn is not None:
             ego_obs = self.mask_fn(ego_obs)
 
-        # 2) Reset buffers when episode ends or recipe changes.
-        recipe_changed = current_recipes != state.current_recipe
-        should_reset = dones | recipe_changed
+        if next_recipes is None:
+            next_recipes = current_recipes
+
+        # 2) If the carried state is stale, reset before writing obs_t.
+        pre_recipe_changed = current_recipes != state.current_recipe
 
         # 3) Normalize action input when enabled.
         if self.use_actions:
@@ -158,7 +174,7 @@ class RecipeContextManager:
             ego_obs,
             partner_act,
             current_recipes,
-            should_reset,
+            pre_recipe_changed,
         )
 
         # 4) Run the encoder only when at least one env just reached K.
@@ -192,11 +208,31 @@ class RecipeContextManager:
             operand=None,
         )
 
+        # 5) Prepare the carry for timestep t+1. If the env transitioned to a
+        # new recipe or episode ended, old obs_t history must not leak forward.
+        post_reset = dones | (next_recipes != current_recipes)
+        reset_ctx = jnp.tile(self.default_ctx, (self.num_envs, 1))
+
+        final_obs_buf = jnp.where(
+            post_reset[:, None, None, None, None],
+            jnp.zeros_like(new_obs_buf),
+            new_obs_buf,
+        )
+        final_act_buf = jnp.where(
+            post_reset[:, None, None],
+            jnp.zeros_like(new_act_buf),
+            new_act_buf,
+        )
+        final_step = jnp.where(post_reset, 0, new_step)
+        final_recipe = jnp.where(post_reset, next_recipes, new_recipe)
+        final_ctx = jnp.where(post_reset[:, None], reset_ctx, final_ctx)
+        final_valid = jnp.where(post_reset, False, final_valid)
+
         return ContextState(
-            obs_buffer=new_obs_buf,
-            act_buffer=new_act_buf,
-            current_step=new_step,
-            current_recipe=new_recipe,
+            obs_buffer=final_obs_buf,
+            act_buffer=final_act_buf,
+            current_step=final_step,
+            current_recipe=final_recipe,
             recipe_ctx=final_ctx,
             valid_mask=final_valid,
         )

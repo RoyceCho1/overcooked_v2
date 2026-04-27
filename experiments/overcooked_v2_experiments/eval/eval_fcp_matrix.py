@@ -202,8 +202,10 @@ def run_episode(
              
              obs_in = obs0_arr[jnp.newaxis, ...] # (1, ...)
              
-             current_rec_id = decode_recipe(next_state.env_state.recipe)
+             current_rec_id = decode_recipe(state.env_state.recipe)
+             next_rec_id = decode_recipe(next_state.env_state.recipe)
              rec_in = jnp.array([current_rec_id])
+             next_rec_in = jnp.array([next_rec_id])
              
              done_val_t = done["__all__"]
              done_arr_in = jnp.array([done_val_t])
@@ -213,7 +215,8 @@ def run_episode(
                  obs_in,
                  act_in, 
                  rec_in, 
-                 done_arr_in 
+                 done_arr_in,
+                 next_recipes=next_rec_in,
              )
              
         # Process rewards

@@ -315,13 +315,15 @@ def _make_scanned_pair_runner(
             total_reward = total_reward + reward["agent_1"] * active_mask
 
             if context_mode == "encoder" and context_manager is not None and ctx_state is not None:
+                recipe_id_current = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
                 recipe_id_next = _recipe_labels(_recipe_bits_from_state(next_state), recipe_codes)
                 ctx_state = context_manager.update(
                     state=ctx_state,
                     ego_obs=jnp.asarray(obs["agent_1"]),
                     partner_act=jnp.asarray(a0, dtype=jnp.int32),
-                    current_recipes=jnp.asarray(recipe_id_next, dtype=jnp.int32),
+                    current_recipes=jnp.asarray(recipe_id_current, dtype=jnp.int32),
                     dones=jnp.asarray(dones["__all__"], dtype=jnp.bool_),
+                    next_recipes=jnp.asarray(recipe_id_next, dtype=jnp.int32),
                 )
 
             done = done | jnp.asarray(dones["__all__"], dtype=jnp.bool_)
@@ -442,13 +444,15 @@ def _run_pair_parallel(
         total_reward = total_reward + reward["agent_1"] * active_mask
 
         if variant.context_mode == "encoder" and context_manager is not None and ctx_state is not None:
+            recipe_id_current = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
             recipe_id_next = _recipe_labels(_recipe_bits_from_state(next_state), recipe_codes)
             ctx_state = context_manager.update(
                 state=ctx_state,
                 ego_obs=jnp.asarray(obs["agent_1"]),
                 partner_act=jnp.asarray(a0, dtype=jnp.int32),
-                current_recipes=jnp.asarray(recipe_id_next, dtype=jnp.int32),
+                current_recipes=jnp.asarray(recipe_id_current, dtype=jnp.int32),
                 dones=jnp.asarray(dones["__all__"], dtype=jnp.bool_),
+                next_recipes=jnp.asarray(recipe_id_next, dtype=jnp.int32),
             )
 
         obs, state = next_obs, next_state

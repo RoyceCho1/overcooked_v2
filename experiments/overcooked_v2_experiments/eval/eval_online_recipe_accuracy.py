@@ -453,8 +453,9 @@ def _make_scanned_online_accuracy_rollout(
                 state=ctx_state,
                 ego_obs=jnp.asarray(obs["agent_1"]),
                 partner_act=jnp.asarray(a0, dtype=jnp.int32),
-                current_recipes=jnp.asarray(next_recipe, dtype=jnp.int32),
+                current_recipes=jnp.asarray(true_recipe, dtype=jnp.int32),
                 dones=jnp.asarray(dones["__all__"], dtype=jnp.bool_),
+                next_recipes=jnp.asarray(next_recipe, dtype=jnp.int32),
             )
             next_done = done | jnp.asarray(dones["__all__"], dtype=jnp.bool_)
 
@@ -664,8 +665,9 @@ def _run_pair_online_accuracy(
             state=ctx_state,
             ego_obs=jnp.asarray(obs["agent_1"]),
             partner_act=jnp.asarray(a0, dtype=jnp.int32),
-            current_recipes=jnp.asarray(next_recipe, dtype=jnp.int32),
+            current_recipes=jnp.asarray(true_recipe, dtype=jnp.int32),
             dones=jnp.asarray(dones["__all__"], dtype=jnp.bool_),
+            next_recipes=jnp.asarray(next_recipe, dtype=jnp.int32),
         )
 
         prev_true_recipe = true_recipe

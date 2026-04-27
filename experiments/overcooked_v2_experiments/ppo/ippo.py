@@ -543,6 +543,13 @@ def make_train(
                 env_act = {k: v.flatten() for k, v in env_act.items()}
 
                 # STEP ENV
+                recipes_before_step = None
+                if context_mode == "encoder" and context_manager is not None:
+                    recipes_before_step = decode_recipe_batch(
+                        env_state.env_state.recipe,
+                        recipe_codes,
+                    )
+
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, model_config["NUM_ENVS"])
 
@@ -551,20 +558,21 @@ def make_train(
                 )(rng_step, env_state, env_act)
                 
                 # --- Update Context ---
-                current_recipes = decode_recipe_batch(
-                    env_state.env_state.recipe,
-                    recipe_codes,
-                )
                 ego_obs_for_encoder = last_obs[env.agents[1]]   # agent_1 obs (ego POV)
                 partner_act = env_act[env.agents[0]]            # agent_0 action
 
                 if context_mode == "encoder" and context_manager is not None:
+                    recipes_after_step = decode_recipe_batch(
+                        env_state.env_state.recipe,
+                        recipe_codes,
+                    )
                     context_state = context_manager.update(
                         context_state,
                         ego_obs_for_encoder,
                         partner_act,
-                        current_recipes,
+                        recipes_before_step,
                         done["__all__"],
+                        next_recipes=recipes_after_step,
                     )
                 # ----------------------
 

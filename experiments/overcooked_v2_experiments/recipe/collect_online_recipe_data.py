@@ -4,7 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -241,6 +241,229 @@ def _write_pair_summary_csv(save_dir: Path, args, completed_pairs: Set[Tuple[int
     tmp_path.replace(path)
 
 
+def _pair_dataset_from_arrays(
+    obs_arr: np.ndarray,
+    recipe_arr: np.ndarray,
+    done_arr: np.ndarray,
+    alive_arr: np.ndarray,
+    context_manager: RecipeContextManager,
+    fcp_run_id: int,
+    partner_run_id: int,
+    num_episodes: int,
+    segment_k: int,
+    segment_stride: int,
+) -> PairDataset:
+    if obs_arr.shape[0] == 0:
+        empty_obs = np.zeros((0, segment_k, *context_manager.obs_shape), dtype=np.float32)
+        empty_i = np.zeros((0,), dtype=np.int32)
+        return PairDataset(empty_obs, empty_i, empty_i, empty_i, empty_i, empty_i)
+
+    obs_arr = obs_arr.astype(np.float32)
+    recipe_arr = recipe_arr.astype(np.int32)
+    done_arr = done_arr.astype(bool)
+    alive_arr = alive_arr.astype(bool)
+    num_steps = obs_arr.shape[0]
+
+    obs_segments = []
+    recipe_segments = []
+    partner_segments = []
+    fcp_segments = []
+    episode_segments = []
+    segment_starts = []
+
+    for ep in range(num_episodes):
+        curr_start = 0
+        while curr_start + segment_k <= num_steps:
+            end = curr_start + segment_k
+            seg_done = done_arr[curr_start:end, ep]
+            seg_alive = alive_arr[curr_start:end, ep]
+            seg_recipe = recipe_arr[curr_start:end, ep]
+
+            if np.any(seg_done) or not np.all(seg_alive):
+                curr_start += segment_stride
+                continue
+
+            if not np.all(seg_recipe == seg_recipe[0]):
+                curr_start += 1
+                continue
+
+            obs_segments.append(obs_arr[curr_start:end, ep])
+            recipe_segments.append(int(seg_recipe[0]))
+            partner_segments.append(int(partner_run_id))
+            fcp_segments.append(int(fcp_run_id))
+            episode_segments.append(int(ep))
+            segment_starts.append(int(curr_start))
+            curr_start += segment_stride
+
+    if not obs_segments:
+        empty_obs = np.zeros((0, segment_k, *context_manager.obs_shape), dtype=np.float32)
+        empty_i = np.zeros((0,), dtype=np.int32)
+        return PairDataset(empty_obs, empty_i, empty_i, empty_i, empty_i, empty_i)
+
+    return PairDataset(
+        obs=np.asarray(obs_segments, dtype=np.float32),
+        recipe=np.asarray(recipe_segments, dtype=np.int32),
+        partner=np.asarray(partner_segments, dtype=np.int32),
+        fcp_run=np.asarray(fcp_segments, dtype=np.int32),
+        episode=np.asarray(episode_segments, dtype=np.int32),
+        segment_start=np.asarray(segment_starts, dtype=np.int32),
+    )
+
+
+def _make_scanned_pair_collector(
+    env_reset_vmapped,
+    env_step_vmapped,
+    fcp_policy,
+    partner_policy,
+    context_manager: RecipeContextManager,
+    mask_fn,
+    num_episodes: int,
+    episode_limit: int,
+    stochastic: bool,
+) -> Callable:
+    """Build a jitted online-data rollout that scans timesteps on-device."""
+
+    def _policy_action(policy, params, obs, done, hstate, key, context=None):
+        done = jnp.asarray(done)
+        if context is None:
+            ac_in = (obs[jnp.newaxis, ...], done[jnp.newaxis, ...])
+        else:
+            ac_in = (
+                obs[jnp.newaxis, ...],
+                done[jnp.newaxis, ...],
+                context[jnp.newaxis, ...],
+            )
+
+        next_hstate, pi, _ = policy.network.apply(params, hstate, ac_in)
+        if stochastic:
+            action = pi.sample(seed=key)
+        else:
+            action = jnp.argmax(pi.probs, axis=-1)
+        return action[0], next_hstate
+
+    def _collect(partner_params, fcp_params, partner_h0, fcp_h0, fcp_run_id, partner_run_id, seed, recipe_codes):
+        episode_ids = jnp.arange(num_episodes, dtype=jnp.int32)
+        reset_keys = jax.vmap(
+            lambda ep_idx: _episode_key(seed, fcp_run_id, partner_run_id, ep_idx)
+        )(episode_ids)
+        obs, state = env_reset_vmapped(reset_keys)
+
+        initial_recipe = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
+        ctx_state = context_manager.init_state(initial_recipe.astype(jnp.int32))
+
+        done = jnp.zeros((num_episodes,), dtype=jnp.bool_)
+        pair_key = jax.random.PRNGKey(seed)
+        pair_key = jax.random.fold_in(pair_key, fcp_run_id)
+        pair_key = jax.random.fold_in(pair_key, partner_run_id)
+
+        def _step(carry, _):
+            obs, state, partner_h, fcp_h, ctx_state, done, pair_key = carry
+
+            alive = ~done
+            true_recipe_code = _recipe_bits_from_state(state).astype(jnp.int32)
+            true_recipe = _recipe_labels(true_recipe_code, recipe_codes).astype(jnp.int32)
+            ego_obs = mask_fn(jnp.asarray(obs["agent_1"]))
+
+            pair_key, k_partner, k_fcp, k_env = jax.random.split(pair_key, 4)
+            a0, partner_h = _policy_action(
+                partner_policy,
+                partner_params,
+                obs["agent_0"],
+                done,
+                partner_h,
+                k_partner,
+            )
+            a1, fcp_h = _policy_action(
+                fcp_policy,
+                fcp_params,
+                obs["agent_1"],
+                done,
+                fcp_h,
+                k_fcp,
+                context=ctx_state.recipe_ctx,
+            )
+
+            step_keys = jax.random.split(k_env, num_episodes)
+            actions = {
+                "agent_0": jnp.asarray(a0, dtype=jnp.int32),
+                "agent_1": jnp.asarray(a1, dtype=jnp.int32),
+            }
+            next_obs, next_state, _, dones, _ = env_step_vmapped(step_keys, state, actions)
+
+            next_recipe = _recipe_labels(_recipe_bits_from_state(next_state), recipe_codes)
+            ctx_state = context_manager.update(
+                state=ctx_state,
+                ego_obs=jnp.asarray(obs["agent_1"]),
+                partner_act=jnp.asarray(a0, dtype=jnp.int32),
+                current_recipes=jnp.asarray(true_recipe, dtype=jnp.int32),
+                dones=jnp.asarray(dones["__all__"], dtype=jnp.bool_),
+                next_recipes=jnp.asarray(next_recipe, dtype=jnp.int32),
+            )
+            next_done = done | jnp.asarray(dones["__all__"], dtype=jnp.bool_)
+
+            next_carry = (next_obs, next_state, partner_h, fcp_h, ctx_state, next_done, pair_key)
+            records = {
+                "obs": ego_obs,
+                "recipe": true_recipe,
+                "done": dones["__all__"],
+                "alive": alive,
+            }
+            return next_carry, records
+
+        carry0 = (obs, state, partner_h0, fcp_h0, ctx_state, done, pair_key)
+        _, records = jax.lax.scan(_step, carry0, None, length=episode_limit)
+        return records
+
+    return jax.jit(_collect)
+
+
+def _collect_pair_dataset_scanned(
+    scanned_collector: Callable,
+    fcp_policy,
+    partner_policy,
+    context_manager: RecipeContextManager,
+    fcp_run_id: int,
+    partner_run_id: int,
+    num_episodes: int,
+    seed: int,
+    recipe_codes,
+    segment_k: int,
+    segment_stride: int,
+) -> PairDataset:
+    partner_h0 = partner_policy.init_hstate(batch_size=num_episodes)
+    fcp_h0 = fcp_policy.init_hstate(batch_size=num_episodes)
+    records = scanned_collector(
+        partner_policy.params,
+        fcp_policy.params,
+        partner_h0,
+        fcp_h0,
+        jnp.asarray(fcp_run_id, dtype=jnp.uint32),
+        jnp.asarray(partner_run_id, dtype=jnp.uint32),
+        jnp.asarray(seed, dtype=jnp.uint32),
+        recipe_codes,
+    )
+    records = jax.tree_util.tree_map(np.asarray, records)
+
+    any_alive = np.any(records["alive"].astype(bool), axis=1)
+    stopped = np.where(~any_alive)[0]
+    if len(stopped) > 0:
+        num_steps = int(stopped[0])
+        records = {name: values[:num_steps] for name, values in records.items()}
+
+    return _pair_dataset_from_arrays(
+        obs_arr=records["obs"],
+        recipe_arr=records["recipe"],
+        done_arr=records["done"],
+        alive_arr=records["alive"],
+        context_manager=context_manager,
+        fcp_run_id=fcp_run_id,
+        partner_run_id=partner_run_id,
+        num_episodes=num_episodes,
+        segment_k=segment_k,
+        segment_stride=segment_stride,
+    )
+
+
 def _collect_pair_dataset(
     env_reset_vmapped,
     env_step_vmapped,
@@ -324,67 +547,42 @@ def _collect_pair_dataset(
             state=ctx_state,
             ego_obs=jnp.asarray(obs["agent_1"]),
             partner_act=jnp.asarray(a0, dtype=jnp.int32),
-            current_recipes=jnp.asarray(next_recipe, dtype=jnp.int32),
+            current_recipes=jnp.asarray(true_recipe, dtype=jnp.int32),
             dones=jnp.asarray(dones["__all__"], dtype=jnp.bool_),
+            next_recipes=jnp.asarray(next_recipe, dtype=jnp.int32),
         )
 
         obs, state = next_obs, next_state
         done = done | jnp.asarray(dones["__all__"], dtype=jnp.bool_)
 
-    if not obs_records:
-        empty_obs = np.zeros((0, segment_k, *context_manager.obs_shape), dtype=np.float32)
-        empty_i = np.zeros((0,), dtype=np.int32)
-        return PairDataset(empty_obs, empty_i, empty_i, empty_i, empty_i, empty_i)
+    obs_arr = np.stack(obs_records, axis=0) if obs_records else np.zeros(
+        (0, *context_manager.obs_shape),
+        dtype=np.float32,
+    )
+    recipe_arr = np.stack(recipe_records, axis=0) if recipe_records else np.zeros(
+        (0, num_episodes),
+        dtype=np.int32,
+    )
+    done_arr = np.stack(done_records, axis=0) if done_records else np.zeros(
+        (0, num_episodes),
+        dtype=bool,
+    )
+    alive_arr = np.stack(alive_records, axis=0) if alive_records else np.zeros(
+        (0, num_episodes),
+        dtype=bool,
+    )
 
-    obs_arr = np.stack(obs_records, axis=0).astype(np.float32)
-    recipe_arr = np.stack(recipe_records, axis=0).astype(np.int32)
-    done_arr = np.stack(done_records, axis=0).astype(bool)
-    alive_arr = np.stack(alive_records, axis=0).astype(bool)
-    num_steps = obs_arr.shape[0]
-
-    obs_segments = []
-    recipe_segments = []
-    partner_segments = []
-    fcp_segments = []
-    episode_segments = []
-    segment_starts = []
-
-    for ep in range(num_episodes):
-        curr_start = 0
-        while curr_start + segment_k <= num_steps:
-            end = curr_start + segment_k
-            seg_done = done_arr[curr_start:end, ep]
-            seg_alive = alive_arr[curr_start:end, ep]
-            seg_recipe = recipe_arr[curr_start:end, ep]
-
-            if np.any(seg_done) or not np.all(seg_alive):
-                curr_start += segment_stride
-                continue
-
-            if not np.all(seg_recipe == seg_recipe[0]):
-                curr_start += 1
-                continue
-
-            obs_segments.append(obs_arr[curr_start:end, ep])
-            recipe_segments.append(int(seg_recipe[0]))
-            partner_segments.append(int(partner_run_id))
-            fcp_segments.append(int(fcp_run_id))
-            episode_segments.append(int(ep))
-            segment_starts.append(int(curr_start))
-            curr_start += segment_stride
-
-    if not obs_segments:
-        empty_obs = np.zeros((0, segment_k, *context_manager.obs_shape), dtype=np.float32)
-        empty_i = np.zeros((0,), dtype=np.int32)
-        return PairDataset(empty_obs, empty_i, empty_i, empty_i, empty_i, empty_i)
-
-    return PairDataset(
-        obs=np.asarray(obs_segments, dtype=np.float32),
-        recipe=np.asarray(recipe_segments, dtype=np.int32),
-        partner=np.asarray(partner_segments, dtype=np.int32),
-        fcp_run=np.asarray(fcp_segments, dtype=np.int32),
-        episode=np.asarray(episode_segments, dtype=np.int32),
-        segment_start=np.asarray(segment_starts, dtype=np.int32),
+    return _pair_dataset_from_arrays(
+        obs_arr=obs_arr,
+        recipe_arr=recipe_arr,
+        done_arr=done_arr,
+        alive_arr=alive_arr,
+        context_manager=context_manager,
+        fcp_run_id=fcp_run_id,
+        partner_run_id=partner_run_id,
+        num_episodes=num_episodes,
+        segment_k=segment_k,
+        segment_stride=segment_stride,
     )
 
 
@@ -414,6 +612,11 @@ def main():
     parser.add_argument("--progress_json", default=None, type=Path)
     parser.add_argument("--overwrite_output", action="store_true")
     parser.add_argument("--stochastic", action="store_true")
+    parser.add_argument(
+        "--disable_scanned_rollout",
+        action="store_true",
+        help="Use the original Python timestep loop instead of the jitted lax.scan rollout.",
+    )
     args = parser.parse_args()
     args._resolved_env_max_steps = (
         int(args.env_max_steps)
@@ -544,6 +747,24 @@ def main():
         for run_id in fcp_run_ids
     }
 
+    scanned_collector = None
+    if not args.disable_scanned_rollout:
+        scanned_collector = _make_scanned_pair_collector(
+            env_reset_vmapped=env_reset_vmapped,
+            env_step_vmapped=env_step_vmapped,
+            fcp_policy=fcp_policy_cache[fcp_run_ids[0]],
+            partner_policy=sp_policy_cache[sp_run_ids[0]],
+            context_manager=context_manager,
+            mask_fn=mask_fn,
+            num_episodes=args.episodes_per_pair,
+            episode_limit=int(args.max_steps),
+            stochastic=args.stochastic,
+        )
+        print(
+            "[Fast rollout] using jitted lax.scan over "
+            f"{int(args.max_steps)} timesteps; first new pair includes compile time."
+        )
+
     pbar = tqdm(total=len(expected_pairs), desc="online dataset pairs")
     pbar.update(len(completed_pairs))
     for fcp_idx, fcp_run_id in enumerate(fcp_run_ids):
@@ -561,23 +782,38 @@ def main():
                 )
                 continue
 
-            pair_data = _collect_pair_dataset(
-                env_reset_vmapped=env_reset_vmapped,
-                env_step_vmapped=env_step_vmapped,
-                fcp_policy=fcp_policy_cache[fcp_run_id],
-                partner_policy=sp_policy_cache[sp_run_id],
-                context_manager=context_manager,
-                mask_fn=mask_fn,
-                fcp_run_id=fcp_run_id,
-                partner_run_id=sp_run_id,
-                num_episodes=args.episodes_per_pair,
-                seed=args.seed,
-                recipe_codes=recipe_codes,
-                env_max_steps=int(env.max_steps),
-                max_steps=int(args.max_steps),
-                segment_k=int(args.segment_k),
-                segment_stride=int(args.segment_stride),
-            )
+            if scanned_collector is None:
+                pair_data = _collect_pair_dataset(
+                    env_reset_vmapped=env_reset_vmapped,
+                    env_step_vmapped=env_step_vmapped,
+                    fcp_policy=fcp_policy_cache[fcp_run_id],
+                    partner_policy=sp_policy_cache[sp_run_id],
+                    context_manager=context_manager,
+                    mask_fn=mask_fn,
+                    fcp_run_id=fcp_run_id,
+                    partner_run_id=sp_run_id,
+                    num_episodes=args.episodes_per_pair,
+                    seed=args.seed,
+                    recipe_codes=recipe_codes,
+                    env_max_steps=int(env.max_steps),
+                    max_steps=int(args.max_steps),
+                    segment_k=int(args.segment_k),
+                    segment_stride=int(args.segment_stride),
+                )
+            else:
+                pair_data = _collect_pair_dataset_scanned(
+                    scanned_collector=scanned_collector,
+                    fcp_policy=fcp_policy_cache[fcp_run_id],
+                    partner_policy=sp_policy_cache[sp_run_id],
+                    context_manager=context_manager,
+                    fcp_run_id=fcp_run_id,
+                    partner_run_id=sp_run_id,
+                    num_episodes=args.episodes_per_pair,
+                    seed=args.seed,
+                    recipe_codes=recipe_codes,
+                    segment_k=int(args.segment_k),
+                    segment_stride=int(args.segment_stride),
+                )
 
             out_file = _pair_file(args.save_dir, fcp_run_id, sp_run_id)
             _write_npz_atomic(
