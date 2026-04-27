@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -222,6 +222,152 @@ def _episode_key(seed: int, fcp_run_id: int, partner_run_id: int, ep_idx: int):
     return key
 
 
+def _make_scanned_pair_runner(
+    env_reset_vmapped,
+    env_step_vmapped,
+    fcp_policy: ContextualPPOPolicy,
+    partner_policy: ContextualPPOPolicy,
+    variant: VariantEvalConfig,
+    context_manager: Optional[RecipeContextManager],
+    num_episodes: int,
+    episode_limit: int,
+    stochastic: bool,
+) -> Callable:
+    """Build a jitted pair evaluator that scans timesteps on-device."""
+
+    context_mode = variant.context_mode
+
+    def _policy_action(policy, params, obs, done, hstate, key, context=None):
+        done = jnp.asarray(done)
+        if context is None:
+            ac_in = (obs[jnp.newaxis, ...], done[jnp.newaxis, ...])
+        else:
+            ac_in = (
+                obs[jnp.newaxis, ...],
+                done[jnp.newaxis, ...],
+                context[jnp.newaxis, ...],
+            )
+
+        next_hstate, pi, _ = policy.network.apply(params, hstate, ac_in)
+        if stochastic:
+            action = pi.sample(seed=key)
+        else:
+            action = jnp.argmax(pi.probs, axis=-1)
+        return action[0], next_hstate
+
+    def _run_pair(partner_params, fcp_params, partner_h0, fcp_h0, fcp_run_id, partner_run_id, seed, recipe_codes):
+        episode_ids = jnp.arange(num_episodes, dtype=jnp.int32)
+        reset_keys = jax.vmap(
+            lambda ep_idx: _episode_key(seed, fcp_run_id, partner_run_id, ep_idx)
+        )(episode_ids)
+        obs, state = env_reset_vmapped(reset_keys)
+
+        ctx_state = None
+        if context_mode == "encoder" and context_manager is not None:
+            recipe_ids = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
+            ctx_state = context_manager.init_state(recipe_ids.astype(jnp.int32))
+
+        total_reward = jnp.zeros((num_episodes,), dtype=jnp.float32)
+        done = jnp.zeros((num_episodes,), dtype=jnp.bool_)
+        pair_key = jax.random.PRNGKey(seed)
+        pair_key = jax.random.fold_in(pair_key, fcp_run_id)
+        pair_key = jax.random.fold_in(pair_key, partner_run_id)
+
+        def _step(carry, _):
+            obs, state, partner_h, fcp_h, ctx_state, total_reward, done, pair_key = carry
+
+            pair_key, k_partner, k_fcp, k_env = jax.random.split(pair_key, 4)
+            step_keys = jax.random.split(k_env, num_episodes)
+
+            a0, partner_h = _policy_action(
+                partner_policy,
+                partner_params,
+                obs["agent_0"],
+                done,
+                partner_h,
+                k_partner,
+            )
+
+            context_vec = None
+            if context_mode == "encoder" and ctx_state is not None:
+                context_vec = ctx_state.recipe_ctx
+            elif context_mode == "oracle":
+                recipe_ids = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
+                context_vec = jax.nn.one_hot(recipe_ids.astype(jnp.int32), len(recipe_codes))
+
+            a1, fcp_h = _policy_action(
+                fcp_policy,
+                fcp_params,
+                obs["agent_1"],
+                done,
+                fcp_h,
+                k_fcp,
+                context=context_vec,
+            )
+
+            actions = {
+                "agent_0": jnp.asarray(a0, dtype=jnp.int32),
+                "agent_1": jnp.asarray(a1, dtype=jnp.int32),
+            }
+            next_obs, next_state, reward, dones, _ = env_step_vmapped(step_keys, state, actions)
+
+            active_mask = (~done).astype(reward["agent_1"].dtype)
+            total_reward = total_reward + reward["agent_1"] * active_mask
+
+            if context_mode == "encoder" and context_manager is not None and ctx_state is not None:
+                recipe_id_next = _recipe_labels(_recipe_bits_from_state(next_state), recipe_codes)
+                ctx_state = context_manager.update(
+                    state=ctx_state,
+                    ego_obs=jnp.asarray(obs["agent_1"]),
+                    partner_act=jnp.asarray(a0, dtype=jnp.int32),
+                    current_recipes=jnp.asarray(recipe_id_next, dtype=jnp.int32),
+                    dones=jnp.asarray(dones["__all__"], dtype=jnp.bool_),
+                )
+
+            done = done | jnp.asarray(dones["__all__"], dtype=jnp.bool_)
+            return (
+                next_obs,
+                next_state,
+                partner_h,
+                fcp_h,
+                ctx_state,
+                total_reward,
+                done,
+                pair_key,
+            ), None
+
+        carry0 = (obs, state, partner_h0, fcp_h0, ctx_state, total_reward, done, pair_key)
+        carry, _ = jax.lax.scan(_step, carry0, None, length=episode_limit)
+        return carry[5]
+
+    return jax.jit(_run_pair)
+
+
+def _run_pair_scanned(
+    scanned_pair_runner: Callable,
+    fcp_policy: ContextualPPOPolicy,
+    partner_policy: ContextualPPOPolicy,
+    fcp_run_id: int,
+    partner_run_id: int,
+    num_episodes: int,
+    seed: int,
+    recipe_codes,
+):
+    partner_h0 = partner_policy.init_hstate(batch_size=num_episodes)
+    fcp_h0 = fcp_policy.init_hstate(batch_size=num_episodes)
+    rewards = scanned_pair_runner(
+        partner_policy.params,
+        fcp_policy.params,
+        partner_h0,
+        fcp_h0,
+        jnp.asarray(fcp_run_id, dtype=jnp.uint32),
+        jnp.asarray(partner_run_id, dtype=jnp.uint32),
+        jnp.asarray(seed, dtype=jnp.uint32),
+        recipe_codes,
+    )
+    return np.asarray(rewards, dtype=np.float32)
+
+
 def _run_pair_parallel(
     env_reset_vmapped,
     env_step_vmapped,
@@ -347,6 +493,11 @@ def main():
         "--overwrite_output",
         action="store_true",
         help="Ignore previous CSVs and start from scratch.",
+    )
+    parser.add_argument(
+        "--disable_scanned_rollout",
+        action="store_true",
+        help="Use the original Python timestep loop instead of the jitted lax.scan rollout.",
     )
     args = parser.parse_args()
 
@@ -496,6 +647,23 @@ def main():
             run_id: _load_policy(variant.fcp_dir, run_id, stochastic=args.stochastic)
             for run_id in fcp_run_ids
         }
+        scanned_pair_runner = None
+        if not args.disable_scanned_rollout:
+            scanned_pair_runner = _make_scanned_pair_runner(
+                env_reset_vmapped=env_reset_vmapped,
+                env_step_vmapped=env_step_vmapped,
+                fcp_policy=fcp_policy_cache[fcp_run_ids[0]],
+                partner_policy=sp_policy_cache[sp_run_ids[0]],
+                variant=variant,
+                context_manager=context_manager if variant.context_mode == "encoder" else None,
+                num_episodes=args.episodes_per_pair,
+                episode_limit=expected_max_steps,
+                stochastic=args.stochastic,
+            )
+            print(
+                "[Fast rollout] using jitted lax.scan over "
+                f"{expected_max_steps} timesteps; first new pair includes compile time."
+            )
         ep_pbar = tqdm(
             total=len(fcp_run_ids) * len(sp_run_ids) * args.episodes_per_pair,
             desc=f"{variant.name} episodes",
@@ -527,11 +695,12 @@ def main():
 
                 partner_policy = sp_policy_cache[sp_run_id]
 
-                pair_key = jax.random.PRNGKey(args.seed)
-                pair_key = jax.random.fold_in(pair_key, int(fcp_run_id))
-                pair_key = jax.random.fold_in(pair_key, int(sp_run_id))
+                if scanned_pair_runner is None:
+                    pair_key = jax.random.PRNGKey(args.seed)
+                    pair_key = jax.random.fold_in(pair_key, int(fcp_run_id))
+                    pair_key = jax.random.fold_in(pair_key, int(sp_run_id))
 
-                rewards = _run_pair_parallel(
+                    rewards = _run_pair_parallel(
                         env_reset_vmapped=env_reset_vmapped,
                         env_step_vmapped=env_step_vmapped,
                         fcp_policy=fcp_policy,
@@ -546,6 +715,17 @@ def main():
                         context_manager=context_manager if variant.context_mode == "encoder" else None,
                         env_max_steps=env.max_steps,
                         max_steps=args.max_steps,
+                    )
+                else:
+                    rewards = _run_pair_scanned(
+                        scanned_pair_runner=scanned_pair_runner,
+                        fcp_policy=fcp_policy,
+                        partner_policy=partner_policy,
+                        fcp_run_id=fcp_run_id,
+                        partner_run_id=sp_run_id,
+                        num_episodes=args.episodes_per_pair,
+                        seed=args.seed,
+                        recipe_codes=recipe_codes,
                     )
                 ep_pbar.update(args.episodes_per_pair)
                 ep_pbar.set_postfix(

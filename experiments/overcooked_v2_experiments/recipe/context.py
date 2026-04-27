@@ -161,23 +161,36 @@ class RecipeContextManager:
             should_reset,
         )
 
-        # 4) Run encoder on all env buffers, then update context for envs that just reached K.
-        if self.use_actions:
-            logits = self.encoder_apply_fn(
-                {"params": self.encoder_params},
-                new_obs_buf,
-                new_act_buf,
-            )
-        else:
-            logits = self.encoder_apply_fn(
-                {"params": self.encoder_params},
-                new_obs_buf,
+        # 4) Run the encoder only when at least one env just reached K.
+        # Most online-eval timesteps already have a valid context, so repeatedly
+        # re-encoding the unchanged buffer is pure overhead.
+        def _encode_and_update(_):
+            if self.use_actions:
+                logits = self.encoder_apply_fn(
+                    {"params": self.encoder_params},
+                    new_obs_buf,
+                    new_act_buf,
+                )
+            else:
+                logits = self.encoder_apply_fn(
+                    {"params": self.encoder_params},
+                    new_obs_buf,
+                )
+            probs = jax.nn.softmax(logits, axis=-1)
+            return (
+                jnp.where(just_finished[:, None], probs, temp_ctx),
+                jnp.where(just_finished, True, temp_valid),
             )
 
-        probs = jax.nn.softmax(logits, axis=-1)
+        def _keep_existing(_):
+            return temp_ctx, temp_valid
 
-        final_ctx = jnp.where(just_finished[:, None], probs, temp_ctx)
-        final_valid = jnp.where(just_finished, True, temp_valid)
+        final_ctx, final_valid = jax.lax.cond(
+            jnp.any(just_finished),
+            _encode_and_update,
+            _keep_existing,
+            operand=None,
+        )
 
         return ContextState(
             obs_buffer=new_obs_buf,

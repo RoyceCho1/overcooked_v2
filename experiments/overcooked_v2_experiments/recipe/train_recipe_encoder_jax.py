@@ -221,6 +221,7 @@ def train(
 
             meta_path = f"{abs_save_path}.meta.json"
             segment_k = None
+            dataset_meta = {}
             dataset_meta_path = os.path.join(os.path.abspath(data_dir), "dataset_meta.json")
             if os.path.exists(dataset_meta_path):
                 try:
@@ -240,6 +241,15 @@ def train(
                 }
                 if segment_k is not None:
                     meta["segment_k"] = int(segment_k)
+                for key in [
+                    "recipe_codes",
+                    "collection_policy",
+                    "obs_source",
+                    "agent_0_role",
+                    "agent_1_role",
+                ]:
+                    if key in dataset_meta:
+                        meta[key] = dataset_meta[key]
                 json.dump(meta, f, indent=2)
             print(f"  -> Metadata saved to {meta_path}")
 
