@@ -593,7 +593,7 @@ def main():
     parser.add_argument("--encoder_ckpt", required=True, type=Path)
     parser.add_argument(
         "--save_dir",
-        default=Path("./runs/k_sweep_demo_cook_simple/k6/recipe_data_k6_online_fcp_obs_only"),
+        default=Path("./runs/k6/data/recipe_data_k6_online_fcp_obs_only"),
         type=Path,
     )
     parser.add_argument("--layout", default="demo_cook_simple")

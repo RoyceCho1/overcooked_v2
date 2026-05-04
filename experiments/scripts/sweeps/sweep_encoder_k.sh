@@ -17,10 +17,10 @@ set -euo pipefail
 # - Evaluation uses compare_fcp_variants.py resume logic via output CSV.
 #
 # Usage:
-#   ./sweep_encoder_k.sh <SP_RUN_DIR> [K_LIST]
+#   ./scripts/sweeps/sweep_encoder_k.sh <SP_RUN_DIR> [K_LIST]
 #
 # Example:
-#   ./sweep_encoder_k.sh /home/myuser/overcooked_v2_experiments/runs/demo_cook_simple_SP "2 4 6 8 10"
+#   ./scripts/sweeps/sweep_encoder_k.sh /home/myuser/overcooked_v2_experiments/runs/demo_cook_simple_SP "2 4 6 8 10"
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <SP_RUN_DIR> [K_LIST]"
@@ -37,9 +37,10 @@ if [[ ! -d "$SP_RUN_DIR" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+EXPERIMENTS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$EXPERIMENTS_ROOT"
 
-SWEEP_ROOT="${SWEEP_ROOT:-$SCRIPT_DIR/runs/k_sweep_demo_cook_simple}"
+SWEEP_ROOT="${SWEEP_ROOT:-$EXPERIMENTS_ROOT/runs}"
 mkdir -p "$SWEEP_ROOT"
 
 # Training/eval defaults (override via env vars).
@@ -90,7 +91,7 @@ for K in $K_LIST; do
     RECIPE_EPISODES_PER_PARTNER=50 \
     RECIPE_INCLUDE_PARTNER_ACTION=false \
     RECIPE_PARTNER_ACTION_VISIBILITY_AWARE=false \
-      ./collect_recipe_dataset.sh "$SP_RUN_DIR" "$DATA_DIR"
+      "$EXPERIMENTS_ROOT/scripts/recipe/collect_recipe_dataset.sh" "$SP_RUN_DIR" "$DATA_DIR"
   else
     echo "[K=$K] Dataset exists, skip: $DATA_DIR"
   fi
@@ -129,7 +130,7 @@ for K in $K_LIST; do
     echo "[K=$K] Training FCP (encoder-conditioned)"
     python -m overcooked_v2_experiments.ppo.main \
       +experiment=rnn-fcp env=demo_cook_simple \
-      +OPTIONAL_PREFIX="k_sweep_demo_cook_simple/k${K}" \
+      +OPTIONAL_PREFIX="k${K}" \
       ++FCP="$SP_RUN_DIR" \
       ++RECIPE_ENCODER_PATH="$ENCODER_CKPT" \
       ++RECIPE_ENCODER_K="$K" \
@@ -139,7 +140,7 @@ for K in $K_LIST; do
       wandb.ENTITY="${WANDB_ENTITY:-}" \
       wandb.PROJECT="${WANDB_PROJECT:-}"
 
-    PREFIX_DIR="$SCRIPT_DIR/runs/k_sweep_demo_cook_simple/k${K}"
+    PREFIX_DIR="$EXPERIMENTS_ROOT/runs/k${K}"
     LATEST_RUN="$(ls -td "$PREFIX_DIR"/FCP_* 2>/dev/null | head -n 1 || true)"
     if [[ -z "$LATEST_RUN" ]]; then
       echo "[K=$K] Error: could not find latest FCP run under $PREFIX_DIR"

@@ -5,8 +5,9 @@ set -euo pipefail
 # It collects a fixed-context online-FCP recipe dataset and trains a fresh K=6
 # obs-only recipe encoder from that dataset.
 
-WORKDIR="${WORKDIR:-/home/myuser/overcooked_v2_experiments}"
-K_ROOT="${K_ROOT:-${WORKDIR}/runs/k_sweep_demo_cook_simple/k6}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKDIR="${WORKDIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+K_ROOT="${K_ROOT:-${WORKDIR}/runs/k6}"
 
 SP_DIR="${SP_DIR:-${WORKDIR}/runs/demo_cook_simple_SP}"
 FCP_DIR="${FCP_DIR:-${K_ROOT}/fcp_training/FCP_demo_cook_simple_SP_vwjkrbm1_20260425-135634}"

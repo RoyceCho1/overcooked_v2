@@ -27,7 +27,7 @@ def main():
     parser.add_argument(
         "--sweep_root",
         type=Path,
-        default=Path("/home/myuser/overcooked_v2_experiments/runs/k_sweep_demo_cook_simple"),
+        default=Path("./runs"),
     )
     args = parser.parse_args()
 

@@ -232,6 +232,7 @@ def _make_scanned_pair_runner(
     num_episodes: int,
     episode_limit: int,
     stochastic: bool,
+    oracle_reset_k: int,
 ) -> Callable:
     """Build a jitted pair evaluator that scans timesteps on-device."""
 
@@ -266,6 +267,8 @@ def _make_scanned_pair_runner(
         if context_mode == "encoder" and context_manager is not None:
             recipe_ids = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
             ctx_state = context_manager.init_state(recipe_ids.astype(jnp.int32))
+        elif context_mode == "oracle_reset_k":
+            ctx_state = jnp.full((num_episodes,), oracle_reset_k, dtype=jnp.int32)
 
         total_reward = jnp.zeros((num_episodes,), dtype=jnp.float32)
         done = jnp.zeros((num_episodes,), dtype=jnp.bool_)
@@ -294,6 +297,12 @@ def _make_scanned_pair_runner(
             elif context_mode == "oracle":
                 recipe_ids = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
                 context_vec = jax.nn.one_hot(recipe_ids.astype(jnp.int32), len(recipe_codes))
+            elif context_mode == "oracle_reset_k":
+                recipe_ids = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
+                oracle_ctx = jax.nn.one_hot(recipe_ids.astype(jnp.int32), len(recipe_codes))
+                default_ctx = jnp.full_like(oracle_ctx, 1.0 / len(recipe_codes))
+                valid_ctx = (ctx_state <= 0) & (~done)
+                context_vec = jnp.where(valid_ctx[:, None], oracle_ctx, default_ctx)
 
             a1, fcp_h = _policy_action(
                 fcp_policy,
@@ -324,6 +333,16 @@ def _make_scanned_pair_runner(
                     current_recipes=jnp.asarray(recipe_id_current, dtype=jnp.int32),
                     dones=jnp.asarray(dones["__all__"], dtype=jnp.bool_),
                     next_recipes=jnp.asarray(recipe_id_next, dtype=jnp.int32),
+                )
+            elif context_mode == "oracle_reset_k":
+                recipe_id_current = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
+                recipe_id_next = _recipe_labels(_recipe_bits_from_state(next_state), recipe_codes)
+                recipe_changed = recipe_id_next != recipe_id_current
+                episode_done = jnp.asarray(dones["__all__"], dtype=jnp.bool_)
+                ctx_state = jnp.where(
+                    recipe_changed | episode_done,
+                    oracle_reset_k,
+                    jnp.maximum(ctx_state - 1, 0),
                 )
 
             done = done | jnp.asarray(dones["__all__"], dtype=jnp.bool_)
@@ -385,6 +404,7 @@ def _run_pair_parallel(
     context_manager: Optional[RecipeContextManager],
     env_max_steps: int,
     max_steps: Optional[int] = None,
+    oracle_reset_k: int = 6,
 ):
     episode_ids = jnp.arange(num_episodes, dtype=jnp.int32)
     reset_keys = jax.vmap(
@@ -399,6 +419,8 @@ def _run_pair_parallel(
     if variant.context_mode == "encoder" and context_manager is not None:
         recipe_ids = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
         ctx_state = context_manager.init_state(recipe_ids.astype(jnp.int32))
+    elif variant.context_mode == "oracle_reset_k":
+        ctx_state = jnp.full((num_episodes,), oracle_reset_k, dtype=jnp.int32)
 
     total_reward = jnp.zeros((num_episodes,), dtype=jnp.float32)
     done = jnp.zeros((num_episodes,), dtype=jnp.bool_)
@@ -424,6 +446,12 @@ def _run_pair_parallel(
         elif variant.context_mode == "oracle":
             recipe_ids = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
             context_vec = jax.nn.one_hot(recipe_ids.astype(jnp.int32), len(recipe_codes))
+        elif variant.context_mode == "oracle_reset_k":
+            recipe_ids = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
+            oracle_ctx = jax.nn.one_hot(recipe_ids.astype(jnp.int32), len(recipe_codes))
+            default_ctx = jnp.full_like(oracle_ctx, 1.0 / len(recipe_codes))
+            valid_ctx = (ctx_state <= 0) & (~done)
+            context_vec = jnp.where(valid_ctx[:, None], oracle_ctx, default_ctx)
 
         # agent_1: evaluated FCP
         a1, fcp_h = fcp_policy.compute_action(
@@ -454,6 +482,16 @@ def _run_pair_parallel(
                 dones=jnp.asarray(dones["__all__"], dtype=jnp.bool_),
                 next_recipes=jnp.asarray(recipe_id_next, dtype=jnp.int32),
             )
+        elif variant.context_mode == "oracle_reset_k":
+            recipe_id_current = _recipe_labels(_recipe_bits_from_state(state), recipe_codes)
+            recipe_id_next = _recipe_labels(_recipe_bits_from_state(next_state), recipe_codes)
+            recipe_changed = recipe_id_next != recipe_id_current
+            episode_done = jnp.asarray(dones["__all__"], dtype=jnp.bool_)
+            ctx_state = jnp.where(
+                recipe_changed | episode_done,
+                oracle_reset_k,
+                jnp.maximum(ctx_state - 1, 0),
+            )
 
         obs, state = next_obs, next_state
         done = done | jnp.asarray(dones["__all__"], dtype=jnp.bool_)
@@ -472,7 +510,7 @@ def main():
         "--variants",
         type=str,
         default="base,encoder,oracle",
-        help="Comma-separated variants to evaluate. Choices: base,encoder,oracle",
+        help="Comma-separated variants to evaluate. Choices: base,encoder,oracle,oracle_reset_k",
     )
     parser.add_argument("--layout", default="demo_cook_simple")
     parser.add_argument("--agent_view_size", type=int, default=2)
@@ -488,6 +526,15 @@ def main():
         type=int,
         default=None,
         help="Sequence length K for context manager. If omitted, infer from encoder/dataset metadata.",
+    )
+    parser.add_argument(
+        "--oracle_reset_k",
+        type=int,
+        default=6,
+        help=(
+            "For variant oracle_reset_k, hide oracle context for this many steps "
+            "after reset/recipe change, then provide the true recipe one-hot."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output_csv", type=Path, default=Path("eval_results_fcp_variants.csv"))
@@ -506,7 +553,7 @@ def main():
     args = parser.parse_args()
 
     selected_variants = [v.strip().lower() for v in args.variants.split(",") if v.strip()]
-    allowed_variants = {"base", "encoder", "oracle"}
+    allowed_variants = {"base", "encoder", "oracle", "oracle_reset_k"}
     invalid_variants = [v for v in selected_variants if v not in allowed_variants]
     if invalid_variants:
         raise ValueError(f"Invalid variants: {invalid_variants}. Allowed: {sorted(allowed_variants)}")
@@ -523,7 +570,7 @@ def main():
             raise FileNotFoundError(f"Encoder variant dir not found: {args.fcp_encoder_dir}")
         if args.encoder_ckpt is None or (not args.encoder_ckpt.exists()):
             raise FileNotFoundError(f"Encoder checkpoint not found: {args.encoder_ckpt}")
-    if "oracle" in selected_variants:
+    if "oracle" in selected_variants or "oracle_reset_k" in selected_variants:
         if args.fcp_oracle_dir is None or (not args.fcp_oracle_dir.exists()):
             raise FileNotFoundError(f"Oracle variant dir not found: {args.fcp_oracle_dir}")
 
@@ -588,6 +635,14 @@ def main():
         variants.append(VariantEvalConfig("encoder", args.fcp_encoder_dir, context_mode="encoder"))
     if "oracle" in selected_variants:
         variants.append(VariantEvalConfig("oracle", args.fcp_oracle_dir, context_mode="oracle"))
+    if "oracle_reset_k" in selected_variants:
+        variants.append(
+            VariantEvalConfig(
+                f"oracle_reset_k{int(args.oracle_reset_k)}",
+                args.fcp_oracle_dir,
+                context_mode="oracle_reset_k",
+            )
+        )
 
     sp_run_ids = _list_run_ids(args.sp_dir)
     if not sp_run_ids:
@@ -663,6 +718,7 @@ def main():
                 num_episodes=args.episodes_per_pair,
                 episode_limit=expected_max_steps,
                 stochastic=args.stochastic,
+                oracle_reset_k=int(args.oracle_reset_k),
             )
             print(
                 "[Fast rollout] using jitted lax.scan over "
@@ -719,6 +775,7 @@ def main():
                         context_manager=context_manager if variant.context_mode == "encoder" else None,
                         env_max_steps=env.max_steps,
                         max_steps=args.max_steps,
+                        oracle_reset_k=int(args.oracle_reset_k),
                     )
                 else:
                     rewards = _run_pair_scanned(
